@@ -1,0 +1,77 @@
+name: Nasaq POS Windows
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: setup-node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: rust-toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: npm-ci
+        run: npm ci
+      - name: check-version
+        run: node tools/check-version.mjs
+      - name: minimum-test-count
+        shell: pwsh
+        run: |
+          $package = Get-Content package.json | ConvertFrom-Json
+          $actual = ($package.scripts.psobject.Properties.Name | Where-Object { $_ -like 'test:*' }).Count
+          $minimum = (Get-Content tools/min-tests.json | ConvertFrom-Json).minimumTestScripts
+          if ($actual -lt $minimum) { throw "عدد أوامر الاختبار $actual أقل من الحد الأدنى $minimum" }
+          Write-Host "Test scripts: $actual (minimum: $minimum)"
+      - name: typecheck
+        run: npm run typecheck
+      - name: lint
+        run: npm run lint
+      - name: npm-test
+        run: npm test
+      - name: cargo-check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+      - name: cargo-test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: cargo-clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+      - name: tauri-build-nsis
+        run: npm run tauri:build -- --bundles nsis
+      - name: installer-sha256
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          if (-not $installer) { throw 'لم يتم العثور على installer' }
+          (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLower() | Out-File -Encoding ascii "$($installer.FullName).sha256"
+      - name: optional-signing
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          if ($env:WINDOWS_CERT_PFX_BASE64 -and $env:WINDOWS_CERT_PASSWORD) {
+            [IO.File]::WriteAllBytes('signing.pfx', [Convert]::FromBase64String($env:WINDOWS_CERT_PFX_BASE64))
+            signtool sign /fd SHA256 /f signing.pfx /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $installer.FullName
+            Remove-Item signing.pfx -Force
+          } else { Write-Host 'الـ installer غير موقّع — ستظهر تحذيرات SmartScreen.' }
+      - name: upload-installer-and-sha256
+        uses: actions/upload-artifact@v4
+        with:
+          name: NasaqPOS-Windows-NSIS
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sha256
+          if-no-files-found: error
